@@ -1,21 +1,5 @@
 """
 LEGO Dealhunter — webhook-server voor Levi Bricks.
-
-Werking:
-1. MPAlerts biedt een RSS-feed voor de zoekopdracht "Lego partij" aan.
-   Wij checken die feed elke paar minuten via GET /check-rss (aangeroepen
-   door een gratis externe "cron"-dienst, bv. cron-job.org).
-2. Wij geven elke nieuwe advertentie door aan Claude, met de volledige
-   Levi Bricks Dealhunter-regels (zie prompt.py).
-3. Alleen als het een score 6+ deal is, sturen we een opgemaakte melding
-   naar jouw Telegram.
-4. Alles (ook afgewezen advertenties) wordt gelogd in dealhunter.db, zodat
-   je kunt controleren of de instellingen goed staan.
-5. POST /webhook/listing blijft ook bestaan, voor als je later alsnog een
-   directe webhook-koppeling vindt.
-
-Start lokaal met:
-    python app.py
 """
 import logging
 import os
@@ -72,7 +56,6 @@ def _extract_price(text: str) -> str:
 
 
 def _parse_rss_feed(feed_url: str) -> list:
-    """Haalt een RSS-feed op en zet elk item om naar ons interne format."""
     resp = requests.get(feed_url, timeout=15)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
@@ -151,6 +134,32 @@ def check_rss():
                 total_new += 1
 
     return jsonify({"checked_feeds": len(RSS_FEED_URLS), "new_items_processed": total_new}), 200
+
+
+@app.route("/test-telegram", methods=["GET"])
+def test_telegram():
+    if not _check_secret():
+        return jsonify({"error": "invalid secret"}), 403
+
+    voorbeeld = {
+        "score": 8,
+        "category": "Lord of the Rings — zeldzaam poppetje",
+        "title": "Grote partij Lego (test)",
+        "price": "€45",
+        "estimated_value": "€180",
+        "profit": "€135",
+        "max_bid": "€60",
+        "url": "https://www.marktplaats.nl/test-advertentie",
+        "negotiation_message": (
+            "Hoi! Ik ben geïnteresseerd in je LEGO-partij. Ik koop LEGO in om te "
+            "verkopen ten bate van een dagbesteding voor mensen met een beperking "
+            "— we hebben een klein budget. Zou €60 mogelijk zijn? Ik kan snel "
+            "langskomen en direct contant betalen."
+        ),
+        "should_notify": True,
+    }
+    sent = send_deal(voorbeeld)
+    return jsonify({"sent": sent}), 200
 
 
 @app.route("/health", methods=["GET"])
