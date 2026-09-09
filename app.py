@@ -4,7 +4,8 @@ LEGO Dealhunter — webhook-server voor Levi Bricks.
 Werking:
 1. MarktAlert of MPAlerts stuurt bij elke nieuwe matchende advertentie
    (Marktplaats, 2dehands, Vinted, Facebook Marketplace) een webhook naar
-   POST /webhook/listing.
+   POST /webhook/listing (in ons eigen formaat, of via het Discord-
+   webhookveld — beide worden herkend).
 2. Wij geven die advertentie door aan Claude, met de volledige Levi Bricks
    Dealhunter-regels (zie prompt.py).
 3. Alleen als het een score 6+ deal is, sturen we een opgemaakte melding
@@ -17,6 +18,7 @@ je los aanlevert (bv. via een eigen prijs-monitor of handmatig getest).
 
 Start lokaal met:
     python app.py
+
 Voor productie: zie deploy/lego-dealhunter.service (systemd, draait continu
 en herstart automatisch).
 """
@@ -50,12 +52,52 @@ def _check_secret():
     return provided == WEBHOOK_SECRET
 
 
+def _extract_field(fields: list, *keywords: str) -> str:
+    """Zoek in een lijst Discord-embed 'fields' naar een veld waarvan de
+    naam een van de keywords bevat, en geef de waarde terug."""
+    for field in fields or []:
+        name = str(field.get("name", "")).lower()
+        if any(kw in name for kw in keywords):
+            return str(field.get("value", "")).strip()
+    return ""
+
+
+def _normalize_discord_payload(data: dict) -> dict:
+    """Zet een Discord-webhook bericht (zoals MPAlerts dat verstuurt als je
+    het 'Discord'-webhookveld gebruikt) om naar ons interne format."""
+    embeds = data.get("embeds") or []
+    embed = embeds[0] if embeds else {}
+    fields = embed.get("fields", [])
+
+    title = embed.get("title") or data.get("content") or ""
+    description = embed.get("description") or ""
+    url = embed.get("url") or ""
+    image = embed.get("image", {}) or {}
+
+    price = _extract_field(fields, "prijs", "price")
+    location = _extract_field(fields, "locatie", "location", "plaats")
+    platform = _extract_field(fields, "platform", "bron", "source") or "Marktplaats"
+
+    return {
+        "title": title,
+        "description": description,
+        "price": price,
+        "platform": platform,
+        "location": location,
+        "url": url,
+        "image_description": image.get("url", ""),
+    }
+
+
 def _normalize_payload(data: dict) -> dict:
     """
     Zet de velden van de externe dienst om naar ons interne format.
-    De exacte veldnamen verschillen per dienst (MarktAlert/MPAlerts) —
-    pas deze mapping aan op basis van hun webhook-documentatie/testbericht.
+    Herkent zowel het 'gewone' webhookformaat van MarktAlert/MPAlerts als
+    het Discord-embedformaat (als je het Discord-webhookveld gebruikt).
     """
+    if "embeds" in data or "content" in data:
+        return _normalize_discord_payload(data)
+
     return {
         "title": data.get("title") or data.get("titel") or "",
         "description": data.get("description") or data.get("beschrijving") or "",
@@ -103,6 +145,7 @@ def webhook_listing():
     data = request.get_json(force=True, silent=True) or {}
     listing = _normalize_payload(data)
     result = _process(listing)
+
     return jsonify({"processed": result is not None, "result": result}), 200
 
 
