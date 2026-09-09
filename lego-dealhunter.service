@@ -1,0 +1,15 @@
+[Unit]
+Description=LEGO Dealhunter webhook server (Levi Bricks)
+After=network.target
+
+[Service]
+Type=simple
+# Pas dit pad aan naar waar je de map hebt gezet op de server:
+WorkingDirectory=/home/levi/lego-dealhunter
+EnvironmentFile=/home/levi/lego-dealhunter/.env
+ExecStart=/home/levi/lego-dealhunter/venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
