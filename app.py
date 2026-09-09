@@ -2,29 +2,27 @@
 LEGO Dealhunter — webhook-server voor Levi Bricks.
 
 Werking:
-1. MarktAlert of MPAlerts stuurt bij elke nieuwe matchende advertentie
-   (Marktplaats, 2dehands, Vinted, Facebook Marketplace) een webhook naar
-   POST /webhook/listing (in ons eigen formaat, of via het Discord-
-   webhookveld — beide worden herkend).
-2. Wij geven die advertentie door aan Claude, met de volledige Levi Bricks
-   Dealhunter-regels (zie prompt.py).
+1. MPAlerts biedt een RSS-feed voor de zoekopdracht "Lego partij" aan.
+   Wij checken die feed elke paar minuten via GET /check-rss (aangeroepen
+   door een gratis externe "cron"-dienst, bv. cron-job.org).
+2. Wij geven elke nieuwe advertentie door aan Claude, met de volledige
+   Levi Bricks Dealhunter-regels (zie prompt.py).
 3. Alleen als het een score 6+ deal is, sturen we een opgemaakte melding
    naar jouw Telegram.
 4. Alles (ook afgewezen advertenties) wordt gelogd in dealhunter.db, zodat
    je kunt controleren of de instellingen goed staan.
-
-Daarnaast: POST /webhook/store-deal voor nieuwe winkeldeals/prijsfouten die
-je los aanlevert (bv. via een eigen prijs-monitor of handmatig getest).
+5. POST /webhook/listing blijft ook bestaan, voor als je later alsnog een
+   directe webhook-koppeling vindt.
 
 Start lokaal met:
     python app.py
-
-Voor productie: zie deploy/lego-dealhunter.service (systemd, draait continu
-en herstart automatisch).
 """
 import logging
 import os
+import re
 
+import requests
+import xml.etree.ElementTree as ET
 from flask import Flask, jsonify, request
 
 from evaluator import evaluate_listing
@@ -39,10 +37,14 @@ logger = logging.getLogger("dealhunter.app")
 
 app = Flask(__name__)
 
-# Simpele gedeelde-secret check, zodat niet iedereen op internet jouw
-# webhook-endpoint kan misbruiken. Zet dezelfde waarde in MarktAlert/MPAlerts
-# (als extra header of query-param) en in je .env als WEBHOOK_SECRET.
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+RSS_FEED_URLS = [
+    url.strip()
+    for url in os.environ.get("RSS_FEED_URLS", "").split(",")
+    if url.strip()
+]
+
+PRICE_PATTERN = re.compile(r"€\s?([\d.,]+)")
 
 
 def _check_secret():
@@ -52,52 +54,7 @@ def _check_secret():
     return provided == WEBHOOK_SECRET
 
 
-def _extract_field(fields: list, *keywords: str) -> str:
-    """Zoek in een lijst Discord-embed 'fields' naar een veld waarvan de
-    naam een van de keywords bevat, en geef de waarde terug."""
-    for field in fields or []:
-        name = str(field.get("name", "")).lower()
-        if any(kw in name for kw in keywords):
-            return str(field.get("value", "")).strip()
-    return ""
-
-
-def _normalize_discord_payload(data: dict) -> dict:
-    """Zet een Discord-webhook bericht (zoals MPAlerts dat verstuurt als je
-    het 'Discord'-webhookveld gebruikt) om naar ons interne format."""
-    embeds = data.get("embeds") or []
-    embed = embeds[0] if embeds else {}
-    fields = embed.get("fields", [])
-
-    title = embed.get("title") or data.get("content") or ""
-    description = embed.get("description") or ""
-    url = embed.get("url") or ""
-    image = embed.get("image", {}) or {}
-
-    price = _extract_field(fields, "prijs", "price")
-    location = _extract_field(fields, "locatie", "location", "plaats")
-    platform = _extract_field(fields, "platform", "bron", "source") or "Marktplaats"
-
-    return {
-        "title": title,
-        "description": description,
-        "price": price,
-        "platform": platform,
-        "location": location,
-        "url": url,
-        "image_description": image.get("url", ""),
-    }
-
-
 def _normalize_payload(data: dict) -> dict:
-    """
-    Zet de velden van de externe dienst om naar ons interne format.
-    Herkent zowel het 'gewone' webhookformaat van MarktAlert/MPAlerts als
-    het Discord-embedformaat (als je het Discord-webhookveld gebruikt).
-    """
-    if "embeds" in data or "content" in data:
-        return _normalize_discord_payload(data)
-
     return {
         "title": data.get("title") or data.get("titel") or "",
         "description": data.get("description") or data.get("beschrijving") or "",
@@ -109,6 +66,36 @@ def _normalize_payload(data: dict) -> dict:
     }
 
 
+def _extract_price(text: str) -> str:
+    match = PRICE_PATTERN.search(text or "")
+    return match.group(0) if match else ""
+
+
+def _parse_rss_feed(feed_url: str) -> list:
+    """Haalt een RSS-feed op en zet elk item om naar ons interne format."""
+    resp = requests.get(feed_url, timeout=15)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    items = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        description = (item.findtext("description") or "").strip()
+        combined_text = f"{title} {description}"
+
+        items.append({
+            "title": title,
+            "description": description,
+            "price": _extract_price(combined_text),
+            "platform": "Marktplaats/MPAlerts",
+            "location": "",
+            "url": link,
+            "image_description": "",
+        })
+    return items
+
+
 def _process(listing: dict):
     url = listing.get("url", "")
     if not url:
@@ -116,7 +103,6 @@ def _process(listing: dict):
         return None
 
     if already_seen(url):
-        logger.info("Al eerder gezien, overslaan: %s", url)
         return None
 
     result = evaluate_listing(listing)
@@ -126,10 +112,8 @@ def _process(listing: dict):
         sent = send_deal(result)
         logger.info(
             "Deal score %s (%s) -> Telegram %s: %s",
-            result.get("score"),
-            result.get("category"),
-            "verstuurd" if sent else "MISLUKT",
-            url,
+            result.get("score"), result.get("category"),
+            "verstuurd" if sent else "MISLUKT", url,
         )
     else:
         logger.info("Afgewezen (score %s): %s", result.get("score"), url)
@@ -141,12 +125,32 @@ def _process(listing: dict):
 def webhook_listing():
     if not _check_secret():
         return jsonify({"error": "invalid secret"}), 403
-
     data = request.get_json(force=True, silent=True) or {}
     listing = _normalize_payload(data)
     result = _process(listing)
-
     return jsonify({"processed": result is not None, "result": result}), 200
+
+
+@app.route("/check-rss", methods=["GET"])
+def check_rss():
+    if not _check_secret():
+        return jsonify({"error": "invalid secret"}), 403
+
+    if not RSS_FEED_URLS:
+        return jsonify({"error": "no RSS_FEED_URLS configured"}), 400
+
+    total_new = 0
+    for feed_url in RSS_FEED_URLS:
+        try:
+            listings = _parse_rss_feed(feed_url)
+        except Exception as exc:
+            logger.error("Kon RSS-feed niet ophalen (%s): %s", feed_url, exc)
+            continue
+        for listing in listings:
+            if _process(listing) is not None:
+                total_new += 1
+
+    return jsonify({"checked_feeds": len(RSS_FEED_URLS), "new_items_processed": total_new}), 200
 
 
 @app.route("/health", methods=["GET"])
